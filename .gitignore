@@ -1,7 +1,64 @@
+# Python
 __pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Type checking
 .mypy_cache/
-*.pyc
+.pytype/
+
+# Logs
+*.log
+
+# Local run script
+run.py
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project-specific
 mypy*.txt
 pylint*.txt
-run.py
+baseline_results.json
+*.bak
+
+# Git
 .git/
