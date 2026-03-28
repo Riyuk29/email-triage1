@@ -1,0 +1,91 @@
+name: email_triage
+version: "1.0.0"
+description: >
+  A real-world OpenEnv environment for email triage. Agents learn to classify,
+  prioritize, route, and respond to realistic business emails — ranging from
+  spam and sales inquiries to legal notices and security disclosures.
+  Designed for training and evaluating LLM-based triage agents.
+
+author: OpenEnv Email Triage
+license: Apache-2.0
+tags:
+  - openenv
+  - email-triage
+  - real-world
+  - llm
+  - text
+  - classification
+  - prioritization
+
+tasks:
+  - id: task_1_easy
+    name: "Basic Email Triage"
+    difficulty: easy
+    description: "Classify 5 straightforward emails with clear categories and priorities"
+    email_count: 5
+    passing_score: 0.70
+
+  - id: task_2_medium
+    name: "Mixed Inbox Triage with Response Drafting"
+    difficulty: medium
+    description: "Triage 8 emails including legal/press/billing with response drafting"
+    email_count: 8
+    passing_score: 0.65
+
+  - id: task_3_hard
+    name: "Crisis Inbox: High-Stakes Triage"
+    difficulty: hard
+    description: "Handle 10 high-stakes emails including SEC inquiries, whistleblowers, and VIP churn"
+    email_count: 10
+    passing_score: 0.60
+
+action_space:
+  type: structured
+  actions:
+    - classify
+    - respond
+    - escalate
+    - archive
+    - skip
+    - flag
+
+observation_space:
+  type: structured
+  fields:
+    - current_email
+    - email_index
+    - total_emails
+    - emails_remaining
+    - action_feedback
+    - partial_score
+    - cumulative_score
+    - task_instructions
+
+reward:
+  type: dense
+  range: [0.0, 1.0]
+  description: >
+    Per-step reward based on classification accuracy (category, priority, department)
+    and response quality. Partial credit for semantically-close answers.
+    Penalties for skipping urgent emails or responding to spam.
+
+endpoints:
+  reset: POST /reset
+  step: POST /step
+  state: GET /state
+  health: GET /health
+  tasks: GET /tasks
+  grader: POST /grader
+  baseline: POST /baseline
+  web: GET /web
+
+environment:
+  type: http
+  port: 7860
+  concurrent_sessions: true
+  max_steps_per_episode: 50
+  episode_determinism: seeded
+
+docker:
+  base_image: python:3.11-slim
+  port: 7860

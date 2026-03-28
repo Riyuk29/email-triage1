@@ -1,0 +1,7 @@
+__pycache__/
+.mypy_cache/
+*.pyc
+mypy*.txt
+pylint*.txt
+run.py
+.git/
