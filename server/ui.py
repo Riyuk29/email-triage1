@@ -332,7 +332,7 @@ async function bl() {
 
 async function llmBl() {
   const taskId = document.getElementById('ts').value;
-  const model = (document.getElementById('lm').value || 'gpt-4o-mini').trim();
+  const model = 'gpt-4o-mini';
   lg('Executing LLM baseline on ' + taskId + ' with ' + model + '...', 'i');
   try {
     const data = await requestJson('/baseline/llm', {
