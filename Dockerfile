@@ -1,5 +1,6 @@
 # Email Triage OpenEnv - Dockerfile
 # Compatible with Hugging Face Spaces (port 7860)
+# Rebuild trigger: refresh Space builder state
 
 FROM python:3.11-slim
 
