@@ -1,3 +1,12 @@
+---
+title: Email Triage
+emoji: "📧"
+colorFrom: blue
+colorTo: yellow
+sdk: docker
+app_port: 7860
+---
+
 # 📧 Email Triage OpenEnv
 
 [![OpenEnv](https://img.shields.io/badge/OpenEnv-v1.0-blue)](https://github.com/meta-pytorch/OpenEnv)
