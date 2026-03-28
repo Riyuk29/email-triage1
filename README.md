@@ -3,7 +3,7 @@ title: Email Triage
 emoji: "📧"
 colorFrom: blue
 colorTo: yellow
-sdk: docker
+sdk: static
 app_port: 7860
 pinned: false
 ---
