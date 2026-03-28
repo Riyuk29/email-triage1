@@ -42,9 +42,11 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:7860/health || exit 1
 
 # Environment variables with defaults
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONIOENCODING=UTF-8
 ENV PORT=7860
 ENV HOST=0.0.0.0
-ENV WORKERS=2
+ENV WORKERS=1
 
 # Start server
 CMD uvicorn app:app \
