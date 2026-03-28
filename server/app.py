@@ -5,6 +5,7 @@ Email Triage Environment - FastAPI Server
 import os
 import sys
 import json
+import re
 import time
 from typing import Optional, Dict, Any, List
 
@@ -12,6 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
     from fastapi import FastAPI, HTTPException, Request
+    from fastapi.concurrency import run_in_threadpool
     from fastapi.responses import HTMLResponse, JSONResponse
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import RedirectResponse
@@ -19,11 +21,74 @@ try:
 except ImportError:
     FASTAPI_AVAILABLE = False
 
+try:
+    from openai import OpenAI
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OpenAI = None
+    OPENAI_AVAILABLE = False
+
 
 from environment import EmailTriageEnvironment
 from models import TriageAction, ActionType, Category, Priority, Department
 from data import get_all_tasks, TASKS
 from graders import compute_episode_score
+from server.ui import WEB_UI
+
+
+DEFAULT_LLM_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+LLM_SEED = 42
+LLM_SYSTEM_PROMPT = """You are an expert email triage agent for a SaaS company.
+
+For each email you receive, you must output a JSON action following the schema below.
+
+## Available Action Types
+- classify: Assign category, priority, and department
+- respond: Draft an email response (use after classify when response is needed)
+- escalate: Escalate to human/management (include escalation_reason)
+- archive: Archive a processed email
+- skip: Skip an email (use sparingly)
+
+## Categories
+customer_complaint, sales_inquiry, technical_support, billing, partnership,
+internal, spam, legal, press, other
+
+## Priorities
+urgent (respond <1hr), high (respond <4hrs), medium (respond <24hrs),
+low (can wait), ignore (spam/no action)
+
+## Departments
+support, sales, engineering, finance, legal, marketing, executive, ignore
+
+## Critical Rules
+- Legal/regulatory emails (SEC, lawsuits, patents): category=legal, priority=urgent, department=legal
+- Security vulnerabilities: category=technical_support, priority=urgent, department=engineering
+- Press with negative stories: category=press, priority=urgent, department=executive
+- VIP customer churn risk: category=customer_complaint, priority=urgent, department=executive
+- Acquisition inquiries: category=partnership, priority=urgent, department=executive
+- Spam/phishing: category=spam, priority=ignore, department=ignore
+- Billing disputes: category=billing, priority=high or urgent, department=finance
+- Internal company emails: category=internal, priority=low, department=ignore
+
+## Output Format
+Always respond with a single JSON object and nothing else. No markdown, no explanation.
+
+Example:
+{
+  "action_type": "classify",
+  "category": "customer_complaint",
+  "priority": "urgent",
+  "department": "support",
+  "reasoning": "Customer explicitly says service is broken and threatens Twitter post"
+}
+
+For response drafts:
+{
+  "action_type": "respond",
+  "draft_response": "Dear [Name],\\n\\nThank you for reaching out...",
+  "reasoning": "Urgent complaint requires immediate acknowledgment"
+}
+"""
 
 
 def _rule_based_classify(email) -> TriageAction:
@@ -233,6 +298,227 @@ def _make_response_draft(email) -> str:
     )
 
 
+def _task_ids_for_request(task_id: Optional[str]) -> List[str]:
+    if task_id in (None, "", "all"):
+        return list(TASKS.keys())
+    if task_id not in TASKS:
+        raise ValueError(f"Unknown task: {task_id}")
+    return [task_id]
+
+
+def _make_llm_client():
+    if not OPENAI_AVAILABLE or OpenAI is None:
+        raise RuntimeError("The openai package is not installed in this Space.")
+
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError(
+            "OPENAI_API_KEY is not configured for this Space. Add it as a Space secret to run the LLM baseline."
+        )
+
+    client_kwargs: Dict[str, Any] = {"api_key": api_key}
+    base_url = os.getenv("OPENAI_BASE_URL", "").strip()
+    if base_url:
+        client_kwargs["base_url"] = base_url
+
+    return OpenAI(**client_kwargs)
+
+
+def _build_llm_prompt(obs: Dict[str, Any]) -> str:
+    email = obs.get("current_email")
+    if not email:
+        return "No email available."
+
+    parts = [
+        "## Email to Triage",
+        f"**From:** {email['sender']} ({email['sender_domain']})",
+        f"**Subject:** {email['subject']}",
+        f"**Timestamp:** {email.get('timestamp', 'unknown')}",
+        f"**Thread length:** {email.get('thread_length', 1)} message(s)",
+        f"**Has attachments:** {email.get('has_attachments', False)}",
+        "",
+        "**Body:**",
+        f"{email['body']}",
+        "",
+        "---",
+        f"Email {obs['email_index'] + 1} of {obs['total_emails']} ({obs['emails_remaining']} remaining)",
+    ]
+
+    if obs.get("action_feedback") and obs["action_feedback"] not in (
+        "New episode started. Triage the inbox.", ""
+    ):
+        parts.append(f"\n**Previous feedback:** {obs['action_feedback']}")
+
+    parts.append("\nOutput your action as a single JSON object.")
+    return "\n".join(parts)
+
+
+def _parse_llm_action(llm_output: str) -> Optional[Dict[str, Any]]:
+    try:
+        return json.loads(llm_output.strip())
+    except json.JSONDecodeError:
+        pass
+
+    match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", llm_output, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except json.JSONDecodeError:
+            pass
+
+    match = re.search(r"\{[^{}]*\}", llm_output, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            pass
+
+    return None
+
+
+def _fallback_llm_action() -> Dict[str, str]:
+    return {
+        "action_type": "classify",
+        "category": "other",
+        "priority": "medium",
+        "department": "support",
+        "reasoning": "Fallback action used because the LLM response was not valid JSON.",
+    }
+
+
+def _run_rule_baseline(task_ids: List[str]) -> Dict[str, Any]:
+    started_at = time.time()
+    results = {}
+
+    for task_id in task_ids:
+        task_config = TASKS[task_id]
+        env = EmailTriageEnvironment()
+        obs = env.reset(task_id=task_id, seed=LLM_SEED)
+        scores = []
+        awaiting_response = False
+
+        for _ in range(len(task_config["emails"]) * 4):
+            if obs.done or obs.current_email is None:
+                break
+            email = obs.current_email
+
+            if awaiting_response:
+                action = TriageAction(
+                    action_type=ActionType.RESPOND,
+                    draft_response=_make_response_draft(email),
+                )
+                awaiting_response = False
+            else:
+                action = _rule_based_classify(email)
+                for item in task_config["emails"]:
+                    if item["id"] == email.id and item.get("response_required", False):
+                        awaiting_response = True
+                        break
+
+            obs = env.step(action)
+            scores.append(obs.partial_score)
+
+        episode_result = compute_episode_score(scores, task_config["passing_score"])
+        results[task_id] = {
+            "task_name": task_config["name"],
+            "difficulty": task_config["difficulty"],
+            "score": episode_result.score,
+            "passed": episode_result.passed,
+            "passing_threshold": task_config["passing_score"],
+            "emails_graded": len(scores),
+        }
+
+    return {
+        "agent": "rule_based_baseline",
+        "timestamp": started_at,
+        "results": results,
+        "summary": {
+            "tasks_run": len(results),
+            "tasks_passed": sum(1 for result in results.values() if result["passed"]),
+            "mean_score": sum(result["score"] for result in results.values()) / len(results),
+        },
+        "runtime_seconds": round(time.time() - started_at, 2),
+    }
+
+
+def _run_llm_baseline(task_ids: List[str], model: str) -> Dict[str, Any]:
+    started_at = time.time()
+    client = _make_llm_client()
+    results = {}
+    total_parse_fallbacks = 0
+
+    for task_id in task_ids:
+        task_config = TASKS[task_id]
+        env = EmailTriageEnvironment()
+        obs = env.reset(task_id=task_id, seed=LLM_SEED)
+        scores = []
+        step_count = 0
+        parse_fallbacks = 0
+        max_steps = len(task_config["emails"]) * 4
+
+        while not obs.done and obs.current_email is not None and step_count < max_steps:
+            step_count += 1
+            obs_data = obs.model_dump()
+            messages = [
+                {"role": "system", "content": LLM_SYSTEM_PROMPT},
+                {"role": "user", "content": _build_llm_prompt(obs_data)},
+            ]
+
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=messages,  # type: ignore[arg-type]
+                    temperature=0.0,
+                    max_tokens=500,
+                    seed=LLM_SEED,
+                )
+                llm_output = response.choices[0].message.content or ""
+            except Exception as exc:
+                raise RuntimeError(
+                    f"LLM request failed for {task_id} at step {step_count}: {exc}"
+                ) from exc
+
+            action_payload = _parse_llm_action(llm_output) or _fallback_llm_action()
+            if action_payload.get("reasoning") == _fallback_llm_action()["reasoning"]:
+                parse_fallbacks += 1
+
+            try:
+                action = TriageAction.from_dict(action_payload)
+            except Exception:
+                parse_fallbacks += 1
+                action = TriageAction.from_dict(_fallback_llm_action())
+
+            obs = env.step(action)
+            scores.append(obs.partial_score)
+
+        episode_result = compute_episode_score(scores, task_config["passing_score"])
+        results[task_id] = {
+            "task_name": task_config["name"],
+            "difficulty": task_config["difficulty"],
+            "score": episode_result.score,
+            "passed": episode_result.passed,
+            "passing_threshold": task_config["passing_score"],
+            "emails_graded": len(scores),
+            "steps": step_count,
+            "parse_fallbacks": parse_fallbacks,
+        }
+        total_parse_fallbacks += parse_fallbacks
+
+    return {
+        "agent": "llm_baseline",
+        "model": model,
+        "timestamp": started_at,
+        "results": results,
+        "summary": {
+            "tasks_run": len(results),
+            "tasks_passed": sum(1 for result in results.values() if result["passed"]),
+            "mean_score": sum(result["score"] for result in results.values()) / len(results),
+            "parse_fallbacks": total_parse_fallbacks,
+        },
+        "runtime_seconds": round(time.time() - started_at, 2),
+    }
+
+
 if FASTAPI_AVAILABLE:
     app = FastAPI(
         title="Email Triage OpenEnv",
@@ -250,7 +536,13 @@ if FASTAPI_AVAILABLE:
 
     @app.get("/health")
     async def health():
-        return {"status": "healthy", "environment": "email-triage", "version": "1.0.0"}
+        return {
+            "status": "healthy",
+            "environment": "email-triage",
+            "version": "1.0.0",
+            "llm_baseline_available": OPENAI_AVAILABLE and bool(os.getenv("OPENAI_API_KEY", "").strip()),
+            "default_llm_model": DEFAULT_LLM_MODEL,
+        }
 
     @app.post("/reset")
     async def reset(request: Request):
@@ -332,59 +624,46 @@ if FASTAPI_AVAILABLE:
                 "breakdown": result.breakdown, "details": result.details}
 
     @app.post("/baseline")
-    async def run_baseline():
-        results = {}
-        for task_id, task_config in TASKS.items():
-            env     = EmailTriageEnvironment()
-            obs     = env.reset(task_id=task_id)
-            scores  = []
-            awaiting_response = False
+    async def run_baseline(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
 
-            for _ in range(len(task_config["emails"]) * 4):
-                if obs.done or obs.current_email is None:
-                    break
-                email = obs.current_email
+        try:
+            task_ids = _task_ids_for_request(body.get("task_id"))
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-                if awaiting_response:
-                    action = TriageAction(
-                        action_type=ActionType.RESPOND,
-                        draft_response=_make_response_draft(email),
-                    )
-                    awaiting_response = False
-                else:
-                    action = _rule_based_classify(email)
-                    for e in task_config["emails"]:
-                        if e["id"] == email.id and e.get("response_required", False):
-                            awaiting_response = True
-                            break
+        return await run_in_threadpool(_run_rule_baseline, task_ids)
 
-                obs = env.step(action)
-                scores.append(obs.partial_score)
+    @app.post("/baseline/llm")
+    async def run_llm_baseline(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
 
-            episode_result = compute_episode_score(scores, task_config["passing_score"])
-            results[task_id] = {
-                "task_name":       task_config["name"],
-                "difficulty":      task_config["difficulty"],
-                "score":           episode_result.score,
-                "passed":          episode_result.passed,
-                "passing_threshold": task_config["passing_score"],
-                "emails_graded":   len(scores),
-            }
+        try:
+            task_ids = _task_ids_for_request(body.get("task_id"))
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-        return {
-            "agent": "rule_based_baseline",
-            "timestamp": time.time(),
-            "results": results,
-            "summary": {
-                "tasks_passed": sum(1 for r in results.values() if r["passed"]),
-                "mean_score":   sum(r["score"] for r in results.values()) / len(results),
-            },
-        }
+        model = str(body.get("model") or DEFAULT_LLM_MODEL).strip()
+        if not model:
+            raise HTTPException(status_code=422, detail="Model name cannot be empty.")
+
+        try:
+            return await run_in_threadpool(_run_llm_baseline, task_ids, model)
+        except RuntimeError as exc:
+            message = str(exc)
+            status_code = 503 if "OPENAI_API_KEY" in message or "package is not installed" in message else 502
+            raise HTTPException(status_code=status_code, detail=message) from exc
 
     @app.get("/web",  response_class=HTMLResponse)
     @app.get("/",     response_class=HTMLResponse)
     async def web_ui():
-        return HTMLResponse(content=_WEB_UI)
+        return HTMLResponse(content=WEB_UI)
 
 
 _WEB_UI = r"""<!DOCTYPE html>

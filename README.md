@@ -288,6 +288,11 @@ The baseline uses:
 
 The built-in rule-based baseline runs without any API key via `/baseline`.
 
+When deployed on Hugging Face Spaces, the web UI can also run an LLM baseline
+through `/baseline/llm` if you set `OPENAI_API_KEY` as a Space secret. You can
+optionally set `OPENAI_BASE_URL` for an OpenAI-compatible provider and
+`OPENAI_MODEL` to change the default UI model.
+
 ---
 
 ## 🌐 API Reference
@@ -301,6 +306,7 @@ The built-in rule-based baseline runs without any API key via `/baseline`.
 | `/tasks` | GET | List all tasks + action schema |
 | `/grader` | POST | Grade a completed episode |
 | `/baseline` | POST | Run built-in rule-based baseline |
+| `/baseline/llm` | POST | Run the server-side LLM baseline for one task or all tasks |
 | `/web` | GET | Interactive web UI |
 | `/docs` | GET | OpenAPI documentation |
 
@@ -335,6 +341,9 @@ email_triage_env/
 | `PORT` | `7860` | Server port (7860 for HF Spaces) |
 | `HOST` | `0.0.0.0` | Bind address |
 | `WORKERS` | `2` | Uvicorn worker processes |
+| `OPENAI_API_KEY` | unset | Required for `/baseline/llm` in the deployed Space |
+| `OPENAI_BASE_URL` | unset | Optional OpenAI-compatible base URL override |
+| `OPENAI_MODEL` | `gpt-4o-mini` | Default model shown in the Space UI |
 
 ---
 
