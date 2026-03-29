@@ -293,6 +293,28 @@ through `/baseline/llm` if you set `OPENAI_API_KEY` as a Space secret. You can
 optionally set `OPENAI_BASE_URL` for an OpenAI-compatible provider and
 `OPENAI_MODEL` to change the default UI model.
 
+## 🧪 Phase 2 Evaluation
+
+For judge-style reruns and variance checks, use the local evaluator:
+
+```bash
+# Rule baseline only
+python phase2_eval.py --skip-open-model --repeats 3
+
+# Rule baseline + open-model agent via Hugging Face Inference
+export HF_TOKEN=hf_...
+python phase2_eval.py --model Qwen/Qwen2.5-72B-Instruct --repeats 3
+```
+
+This script:
+- reruns the built-in baseline across all 3 tasks
+- runs an open instruct model across all 3 tasks
+- computes repeat-run variance and pass counts
+- writes a JSON report to `phase2_results.json`
+
+If Hugging Face Inference returns `402 Payment Required`, the token needs active
+provider credits or a PRO plan before the open-model portion can complete.
+
 ---
 
 ## 🌐 API Reference
