@@ -528,7 +528,65 @@ if FASTAPI_AVAILABLE:
     app.add_middleware(CORSMiddleware, allow_origins=["*"],
                        allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-    _env = EmailTriageEnvironment()
+    _episodes: Dict[str, EmailTriageEnvironment] = {}
+    _default_episode_id: Optional[str] = None
+
+    def _reward_value(obs: Any) -> float:
+        reward = getattr(obs, "reward", None)
+        return float(reward) if reward is not None else 0.0
+
+    def _resolve_episode_id(request: Request, body: Optional[Dict[str, Any]] = None) -> Optional[str]:
+        if body and body.get("episode_id"):
+            return str(body["episode_id"])
+
+        header_episode_id = request.headers.get("X-Episode-Id")
+        if header_episode_id:
+            return header_episode_id
+
+        query_episode_id = request.query_params.get("episode_id")
+        if query_episode_id:
+            return query_episode_id
+
+        return None
+
+    def _serialize_transition(
+        obs: Any,
+        state: Dict[str, Any],
+        *,
+        task_id: str,
+        truncated: bool = False,
+    ) -> Dict[str, Any]:
+        episode_id = state.get("episode_id")
+        reward = _reward_value(obs)
+        observation = obs.model_dump()
+        observation["reward"] = reward
+        return {
+            "episode_id": episode_id,
+            "observation": observation,
+            "reward": reward,
+            "done": bool(obs.done),
+            "truncated": truncated,
+            "info": {
+                "task_id": task_id,
+                "episode_id": episode_id,
+                "state": state,
+            },
+            "state": state,
+        }
+
+    def _get_env_for_episode(episode_id: Optional[str]) -> EmailTriageEnvironment:
+        resolved_episode_id = episode_id or _default_episode_id
+        if not resolved_episode_id:
+            raise HTTPException(
+                status_code=400,
+                detail="No active episode. Call POST /reset first or provide an episode_id.",
+            )
+
+        env = _episodes.get(resolved_episode_id)
+        if env is None:
+            raise HTTPException(status_code=404, detail=f"Unknown episode_id: {resolved_episode_id}")
+
+        return env
 
     @app.get("/")
     def root():
@@ -546,35 +604,55 @@ if FASTAPI_AVAILABLE:
 
     @app.post("/reset")
     async def reset(request: Request):
+        global _default_episode_id
         try:
             body = await request.json()
         except Exception:
             body = {}
-        task_id   = body.get("task_id", "task_1_easy")
+
+        task_id = body.get("task_id", "task_1_easy")
         episode_id = body.get("episode_id")
-        seed       = body.get("seed")
-        obs = _env.reset(task_id=task_id, episode_id=episode_id, seed=seed)
-        return {"observation": obs.model_dump(), "reward": obs.reward,
-                "done": obs.done, "info": {"task_id": task_id}}
+        seed = body.get("seed")
+
+        try:
+            env = EmailTriageEnvironment()
+            obs = env.reset(task_id=task_id, episode_id=episode_id, seed=seed)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+        state = env.state.model_dump()
+        resolved_episode_id = state.get("episode_id")
+        if resolved_episode_id:
+            _episodes[resolved_episode_id] = env
+            _default_episode_id = resolved_episode_id
+
+        return _serialize_transition(obs, state, task_id=task_id)
 
     @app.post("/step")
     async def step(request: Request):
-        body = await request.json()
+        global _default_episode_id
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+        episode_id = _resolve_episode_id(request, body)
+        env = _get_env_for_episode(episode_id)
         raw_action = body.get("action", body)
         try:
             action = TriageAction.from_dict(raw_action)
         except Exception as e:
             raise HTTPException(status_code=422, detail=f"Invalid action: {e}") from e
-        obs   = _env.step(action)
-        state = _env.state
-        return {"observation": obs.model_dump(), "reward": obs.reward, "done": obs.done,
-                "info": {"step_count": state.step_count,
-                         "emails_processed": state.emails_processed,
-                         "cumulative_score": state.cumulative_score}}
+        obs = env.step(action)
+        state = env.state.model_dump()
+        _default_episode_id = state.get("episode_id") or episode_id
+        return _serialize_transition(obs, state, task_id=state.get("task_id", ""), truncated=False)
 
     @app.get("/state")
-    async def get_state():
-        return _env.state.model_dump()
+    async def get_state(request: Request):
+        episode_id = _resolve_episode_id(request)
+        env = _get_env_for_episode(episode_id)
+        return env.state.model_dump()
 
     @app.get("/tasks")
     async def list_tasks():
@@ -664,6 +742,12 @@ if FASTAPI_AVAILABLE:
     @app.get("/",     response_class=HTMLResponse)
     async def web_ui():
         return HTMLResponse(content=WEB_UI)
+
+    def main() -> None:
+        import uvicorn
+
+        port = int(os.getenv("PORT", "7860"))
+        uvicorn.run("server.app:app", host="0.0.0.0", port=port, reload=False)
 
 
 _WEB_UI = r"""<!DOCTYPE html>
@@ -894,6 +978,5 @@ function ui(data){
 
 
 if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", "7860"))
-    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+    if FASTAPI_AVAILABLE:
+        main()

@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "email-triage-openenv"
+version = "1.0.0"
+description = "OpenEnv-compatible email triage environment and baseline runners."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115.0",
+  "openai>=1.50.0",
+  "pydantic>=2.10.0",
+  "requests>=2.32.0",
+  "uvicorn[standard]>=0.30.0",
+]
+
+[project.scripts]
+server = "server.app:main"
+baseline = "baseline:main"
+inference = "inference:main"
