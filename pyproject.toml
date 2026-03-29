@@ -21,3 +21,6 @@ dependencies = [
 server = "server.app:main"
 baseline = "baseline:main"
 inference = "inference:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["email_triage_openenv"]
