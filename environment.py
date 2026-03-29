@@ -225,4 +225,11 @@ class EmailTriageEnvironment:
             correct_classifications=sum(1 for s in self._action_scores if s >= 0.75),
             cumulative_score=self._state.cumulative_score,
             task_instructions=self._task_config.get("instructions", ""),
+            metadata={
+                "episode_id": self._state.episode_id,
+                "task_id": self._state.task_id,
+                "task_name": self._state.task_name,
+                "task_difficulty": self._state.task_difficulty,
+                "step_count": self._state.step_count,
+            },
         )

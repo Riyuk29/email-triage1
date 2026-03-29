@@ -87,6 +87,7 @@ class TriageObservation(BaseModel):
     correct_classifications: int = 0
     cumulative_score: float = 0.0
     task_instructions: str = ""
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
 class TriageState(BaseModel):

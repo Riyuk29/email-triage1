@@ -30,7 +30,15 @@ except ImportError:
 
 
 from environment import EmailTriageEnvironment
-from models import TriageAction, ActionType, Category, Priority, Department
+from models import (
+    TriageAction,
+    TriageObservation,
+    TriageState,
+    ActionType,
+    Category,
+    Priority,
+    Department,
+)
 from data import get_all_tasks, TASKS
 from graders import compute_episode_score
 from server.ui import WEB_UI
@@ -601,6 +609,42 @@ if FASTAPI_AVAILABLE:
             "llm_baseline_available": OPENAI_AVAILABLE and bool(os.getenv("OPENAI_API_KEY", "").strip()),
             "default_llm_model": DEFAULT_LLM_MODEL,
         }
+
+    @app.get("/metadata")
+    async def metadata():
+        return {
+            "name": "email_triage",
+            "title": "Email Triage",
+            "description": "OpenEnv-compatible email triage environment for classification, routing, and response drafting.",
+            "version": "1.0.0",
+            "mode": "simulation",
+        }
+
+    @app.get("/schema")
+    async def schema():
+        return {
+            "action": TriageAction.model_json_schema(),
+            "observation": TriageObservation.model_json_schema(),
+            "state": TriageState.model_json_schema(),
+        }
+
+    @app.post("/mcp")
+    async def mcp(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        return JSONResponse(
+            status_code=200,
+            content={
+                "jsonrpc": "2.0",
+                "id": body.get("id"),
+                "error": {
+                    "code": -32600,
+                    "message": "Invalid Request",
+                },
+            },
+        )
 
     @app.post("/reset")
     async def reset(request: Request):
