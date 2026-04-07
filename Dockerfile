@@ -2,7 +2,7 @@
 # Compatible with Hugging Face Spaces (port 7860)
 # Rebuild trigger: refresh Space builder state
 
-FROM python:3.11-slim
+FROM python:3.11.15-slim-bookworm
 
 # Metadata
 LABEL maintainer="openenv-email-triage"
