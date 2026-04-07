@@ -27,7 +27,7 @@ import os
 import re
 import sys
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from openai import OpenAI
@@ -45,6 +45,13 @@ TASK_IDS = ["task_1_easy", "task_2_medium", "task_3_hard"]
 TEMPERATURE = 0.0
 MAX_TOKENS = 500
 RESET_SEED = 42
+DEFAULT_ENV_CANDIDATES = [
+    ENV_BASE_URL,
+    "http://localhost:7860",
+    "http://127.0.0.1:7860",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+]
 
 SYSTEM_PROMPT = """You are an expert email triage agent for a SaaS company.
 
@@ -200,6 +207,43 @@ def _build_client() -> OpenAI:
     return OpenAI(api_key=API_KEY, base_url=API_BASE_URL)
 
 
+def _probe_env(base_url: str) -> Tuple[bool, Optional[Dict[str, Any]]]:
+    try:
+        response = requests.get(f"{base_url.rstrip('/')}/health", timeout=5)
+        response.raise_for_status()
+        return True, response.json()
+    except Exception:
+        return False, None
+
+
+def _resolve_env_url(preferred_url: str) -> str:
+    checked: List[str] = []
+    seen = set()
+
+    for candidate in [preferred_url, *DEFAULT_ENV_CANDIDATES]:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        checked.append(candidate)
+        ok, _ = _probe_env(candidate)
+        if ok:
+            return candidate
+
+    raise RuntimeError(f"Could not reach the environment on any known URL: {', '.join(checked)}")
+
+
+def _discover_task_ids() -> List[str]:
+    try:
+        payload = _call_env("tasks")
+        tasks = payload.get("tasks", [])
+        discovered = [str(task.get("id", "")).strip() for task in tasks if str(task.get("id", "")).strip()]
+        if discovered:
+            return discovered
+    except Exception:
+        pass
+    return TASK_IDS
+
+
 def _sample_reward(step_result: Dict[str, Any]) -> float:
     if "reward" in step_result and step_result["reward"] is not None:
         try:
@@ -342,13 +386,18 @@ async def main() -> int:
     parser = argparse.ArgumentParser(description="Run the Email Triage Phase-2 inference baseline")
     parser.add_argument("--env-url", default=ENV_BASE_URL, help="Environment server URL")
     parser.add_argument("--model", default=MODEL_NAME, help="LLM model name")
-    parser.add_argument("--task", default="all", choices=TASK_IDS + ["all"], help="Task to run")
+    parser.add_argument("--task", default="all", help="Task to run")
     parser.add_argument("--output", default="baseline_results.json", help="Output JSON path")
     args = parser.parse_args()
 
-    ENV_BASE_URL = args.env_url
+    ENV_BASE_URL = _resolve_env_url(args.env_url)
     client = _build_client()
-    task_ids = TASK_IDS if args.task == "all" else [args.task]
+    available_task_ids = _discover_task_ids()
+    task_ids = available_task_ids if args.task == "all" else [args.task]
+
+    if args.task != "all" and args.task not in available_task_ids:
+        _stderr(f"Unknown task '{args.task}'. Available tasks: {', '.join(available_task_ids)}")
+        return 1
 
     results: Dict[str, Any] = {
         "api_base_url": API_BASE_URL,
