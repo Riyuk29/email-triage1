@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
 """
-Repo-root deterministic baseline runner expected by submission validators.
+Phase-2 inference runner for the Email Triage OpenEnv submission.
 
-The validator parses structured stdout blocks in this form:
-  [START] task=task_id
-  [STEP] task=task_id step=N reward=0.1234
-  [END] task=task_id score=0.9876 steps=N
+Required environment variables for the LLM path:
+  API_BASE_URL   - OpenAI-compatible inference endpoint
+  MODEL_NAME     - Model identifier for completions
+  HF_TOKEN       - API key / Hugging Face token
 
-This script therefore runs the deterministic rule baseline task-by-task and
-prints those markers to stdout with flush=True while still saving a JSON report.
+Optional:
+  ENV_BASE_URL      - Environment server URL
+  LOCAL_IMAGE_NAME  - Reserved for evaluator compatibility when using local images
+
+Structured stdout format is intentionally minimal because the validator parses
+these lines strictly:
+  [START] task=<task_id>
+  [STEP] step=<n> reward=<reward>
+  [END] task=<task_id> score=<score> steps=<n>
 """
 
 from __future__ import annotations
@@ -16,165 +23,317 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
-DEFAULT_ENV_URL = os.getenv("ENV_BASE_URL", "http://localhost:8000")
+import requests
+from openai import OpenAI
+
+API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
+MODEL_NAME = os.getenv("MODEL_NAME", "meta-llama/Llama-3.1-8B-Instruct")
+HF_TOKEN = os.getenv("HF_TOKEN")
+ENV_BASE_URL = os.getenv("ENV_BASE_URL", "http://localhost:7860")
+LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME")
+
+TASK_IDS = ["task_1_easy", "task_2_medium", "task_3_hard"]
+TEMPERATURE = 0.0
+MAX_TOKENS = 500
+RESET_SEED = 42
+
+SYSTEM_PROMPT = """You are an expert email triage agent for a SaaS company.
+
+For each email you receive, you must output a single JSON action.
+
+Available action types:
+- classify: set category, priority, and department
+- respond: send a draft_response
+- escalate: include escalation_reason
+- archive
+- skip
+- flag: include flag_reason
+
+Categories:
+customer_complaint, sales_inquiry, technical_support, billing, partnership,
+internal, spam, legal, press, other
+
+Priorities:
+urgent, high, medium, low, ignore
+
+Departments:
+support, sales, engineering, finance, legal, marketing, executive, ignore
+
+Critical guidance:
+- Legal or regulatory notices -> legal / urgent / legal
+- Security vulnerabilities -> technical_support / urgent / engineering
+- Negative press on deadline -> press / urgent / executive
+- VIP churn risk -> customer_complaint / urgent / executive
+- Acquisition outreach -> partnership / urgent / executive
+- Spam or phishing -> spam / ignore / ignore
+- Billing disputes -> billing / high or urgent / finance
+- Internal company emails -> internal / low / ignore
+
+Respond only with one valid JSON object and nothing else.
+"""
 
 
-def _emit(marker: str, **fields: Any) -> None:
-    parts = [f"[{marker}]"]
-    for key, value in fields.items():
-        if isinstance(value, float):
-            rendered = f"{value:.4f}"
-        else:
-            rendered = str(value).replace(" ", "_")
-        parts.append(f"{key}={rendered}")
-    print(" ".join(parts), flush=True)
+def _stderr(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
 
 
-def _run_local_baseline(task_id: Optional[str]) -> Dict[str, Any]:
-    from data import TASKS
-    from environment import EmailTriageEnvironment
-    from graders import compute_episode_score
-    from models import TriageAction
-    from server.app import (
-        LLM_SEED,
-        _make_response_draft,
-        _rule_based_classify,
-        _task_ids_for_request,
+def _emit_start(task_id: str) -> None:
+    print(f"[START] task={task_id}", flush=True)
+
+
+def _emit_step(step: int, reward: float) -> None:
+    print(f"[STEP] step={step} reward={reward:.4f}", flush=True)
+
+
+def _emit_end(task_id: str, score: float, steps: int) -> None:
+    print(f"[END] task={task_id} score={score:.4f} steps={steps}", flush=True)
+
+
+def _call_env(endpoint: str, method: str = "GET", payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    url = f"{ENV_BASE_URL.rstrip('/')}/{endpoint.lstrip('/')}"
+    if method == "POST":
+        response = requests.post(url, json=payload or {}, timeout=30)
+    else:
+        response = requests.get(url, timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+
+def _parse_action(text: str) -> Optional[Dict[str, Any]]:
+    try:
+        return json.loads(text.strip())
+    except json.JSONDecodeError:
+        pass
+
+    match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except json.JSONDecodeError:
+            pass
+
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            pass
+
+    return None
+
+
+def _build_prompt(observation: Dict[str, Any]) -> str:
+    email = observation.get("current_email")
+    if not email:
+        return "No email is currently available."
+
+    parts = [
+        "## Email to Triage",
+        f"From: {email['sender']} ({email['sender_domain']})",
+        f"Subject: {email['subject']}",
+        f"Timestamp: {email.get('timestamp', 'unknown')}",
+        f"Thread length: {email.get('thread_length', 1)}",
+        f"Has attachments: {email.get('has_attachments', False)}",
+        "",
+        "Body:",
+        email["body"],
+        "",
+        f"Email {observation.get('email_index', 0) + 1} of {observation.get('total_emails', '?')}",
+    ]
+
+    feedback = observation.get("action_feedback") or ""
+    if feedback and feedback != "New episode started. Triage the inbox.":
+        parts.extend(["", f"Previous feedback: {feedback}"])
+
+    parts.extend(["", "Return a single JSON object only."])
+    return "\n".join(parts)
+
+
+def _fallback_action(observation: Dict[str, Any]) -> Dict[str, Any]:
+    from models import Email
+    from server.app import _make_response_draft, _rule_based_classify
+
+    raw_email = observation.get("current_email") or {}
+    email = Email(
+        id=raw_email.get("id", ""),
+        sender=raw_email.get("sender", ""),
+        sender_domain=raw_email.get("sender_domain", ""),
+        subject=raw_email.get("subject", ""),
+        body=raw_email.get("body", ""),
+        timestamp=raw_email.get("timestamp", ""),
+        has_attachments=bool(raw_email.get("has_attachments", False)),
+        thread_length=int(raw_email.get("thread_length", 1)),
     )
 
-    task_ids = _task_ids_for_request(task_id)
-    started_at = time.time()
-    results: Dict[str, Any] = {}
-
-    for current_task_id in task_ids:
-        task_config = TASKS[current_task_id]
-        env = EmailTriageEnvironment()
-        obs = env.reset(task_id=current_task_id, seed=LLM_SEED)
-        scores = []
-        awaiting_response = False
-        step_count = 0
-
-        _emit("START", task=current_task_id, difficulty=task_config["difficulty"])
-
-        for _ in range(len(task_config["emails"]) * 4):
-            if obs.done or obs.current_email is None:
-                break
-
-            email = obs.current_email
-            if awaiting_response:
-                action = {
-                    "action_type": "respond",
-                    "draft_response": _make_response_draft(email),
-                }
-                awaiting_response = False
-            else:
-                triage_action = _rule_based_classify(email)
-                action = triage_action.model_dump(mode="json")
-                for item in task_config["emails"]:
-                    if item["id"] == email.id and item.get("response_required", False):
-                        awaiting_response = True
-                        break
-
-            obs = env.step(TriageAction.from_dict(action))
-            step_count += 1
-            scores.append(obs.partial_score)
-            reward = float(obs.reward) if obs.reward is not None else 0.0
-
-            _emit(
-                "STEP",
-                task=current_task_id,
-                step=step_count,
-                reward=reward,
-                partial_score=float(obs.partial_score),
-                action=action["action_type"],
-            )
-
-        episode_result = compute_episode_score(scores, task_config["passing_score"])
-        results[current_task_id] = {
-            "task_name": task_config["name"],
-            "difficulty": task_config["difficulty"],
-            "score": episode_result.score,
-            "passed": episode_result.passed,
-            "passing_threshold": task_config["passing_score"],
-            "emails_graded": len(scores),
-            "steps": step_count,
+    feedback = (observation.get("action_feedback") or "").lower()
+    if "response" in feedback or "draft" in feedback:
+        return {
+            "action_type": "respond",
+            "draft_response": _make_response_draft(email),
+            "reasoning": "Fallback response action after classifier feedback indicated a reply is needed.",
         }
 
-        _emit(
-            "END",
-            task=current_task_id,
-            score=float(episode_result.score),
-            steps=step_count,
-            passed=str(bool(episode_result.passed)).lower(),
-            threshold=float(task_config["passing_score"]),
-        )
+    action = _rule_based_classify(email).model_dump(mode="json")
+    action["reasoning"] = "Deterministic fallback action."
+    return action
+
+
+def _build_client() -> Optional[OpenAI]:
+    if not HF_TOKEN:
+        _stderr("HF_TOKEN is not set; using deterministic fallback actions.")
+        return None
+    return OpenAI(api_key=HF_TOKEN, base_url=API_BASE_URL)
+
+
+def _sample_reward(step_result: Dict[str, Any]) -> float:
+    if "reward" in step_result and step_result["reward"] is not None:
+        try:
+            return float(step_result["reward"])
+        except (TypeError, ValueError):
+            pass
+
+    observation = step_result.get("observation", {})
+    reward = observation.get("reward")
+    if reward is None:
+        return 0.0
+    try:
+        return float(reward)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _task_score(task_id: str, action_scores: List[float]) -> float:
+    if not action_scores:
+        return 0.0
+
+    result = _call_env(
+        "grader",
+        "POST",
+        {
+            "task_id": task_id,
+            "action_scores": action_scores,
+        },
+    )
+    try:
+        return float(result.get("score", 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _run_task(client: Optional[OpenAI], task_id: str, model_name: str) -> Dict[str, Any]:
+    reset = _call_env(
+        "reset",
+        "POST",
+        {
+            "task_id": task_id,
+            "seed": RESET_SEED,
+        },
+    )
+    observation = reset.get("observation", {})
+    done = bool(reset.get("done", observation.get("done", False)))
+    total_emails = int(observation.get("total_emails", 0) or 0)
+    max_steps = max(total_emails * 4, 1)
+    action_scores: List[float] = []
+    step = 0
+
+    _emit_start(task_id)
+
+    while not done and step < max_steps:
+        step += 1
+        action = None
+
+        if client is not None:
+            try:
+                completion = client.chat.completions.create(
+                    model=model_name,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": _build_prompt(observation)},
+                    ],
+                    temperature=TEMPERATURE,
+                    max_tokens=MAX_TOKENS,
+                )
+                content = completion.choices[0].message.content or ""
+                action = _parse_action(content)
+            except Exception as exc:
+                _stderr(f"LLM call failed on {task_id} step {step}: {exc}")
+
+        if not action:
+            action = _fallback_action(observation)
+
+        step_result = _call_env("step", "POST", {"action": action})
+        observation = step_result.get("observation", {})
+        done = bool(step_result.get("done", observation.get("done", False)))
+        partial_score = observation.get("partial_score", 0.0)
+        try:
+            action_scores.append(float(partial_score))
+        except (TypeError, ValueError):
+            action_scores.append(0.0)
+
+        _emit_step(step, _sample_reward(step_result))
+        time.sleep(0.05)
+
+    score = _task_score(task_id, action_scores)
+    _emit_end(task_id, score, step)
 
     return {
-        "agent": "rule_based_baseline",
-        "timestamp": started_at,
-        "results": results,
-        "summary": {
-            "tasks_run": len(results),
-            "tasks_passed": sum(1 for result in results.values() if result["passed"]),
-            "mean_score": sum(result["score"] for result in results.values()) / len(results),
-        },
-        "runtime_seconds": round(time.time() - started_at, 2),
+        "task_id": task_id,
+        "score": score,
+        "steps": step,
+        "action_scores": action_scores,
     }
 
 
-def _write_report(result: Dict[str, Any], output_path: str) -> None:
-    with open(output_path, "w", encoding="utf-8") as handle:
-        json.dump(result, handle, indent=2)
+def _write_report(path: str, results: Dict[str, Any]) -> None:
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(results, handle, indent=2)
 
 
-def main() -> Dict[str, Any]:
-    parser = argparse.ArgumentParser(description="Run the deterministic Email Triage baseline")
-    parser.add_argument(
-        "--env-url",
-        default=DEFAULT_ENV_URL,
-        help="Environment server URL (accepted for validator compatibility; local baseline is used).",
-    )
-    parser.add_argument(
-        "--task",
-        default="all",
-        choices=["all", "task_1_easy", "task_2_medium", "task_3_hard"],
-        help="Run one task or all tasks",
-    )
-    parser.add_argument(
-        "--output",
-        default="baseline_results.json",
-        help="Where to write the JSON report",
-    )
+def main() -> int:
+    global ENV_BASE_URL
+
+    parser = argparse.ArgumentParser(description="Run the Email Triage Phase-2 inference baseline")
+    parser.add_argument("--env-url", default=ENV_BASE_URL, help="Environment server URL")
+    parser.add_argument("--model", default=MODEL_NAME, help="LLM model name")
+    parser.add_argument("--task", default="all", choices=TASK_IDS + ["all"], help="Task to run")
+    parser.add_argument("--output", default="baseline_results.json", help="Output JSON path")
     args = parser.parse_args()
 
-    task_id: Optional[str] = None if args.task == "all" else args.task
-    started_at = time.time()
-    result = _run_local_baseline(task_id)
-    result["execution_mode"] = "local"
-    result["env_url"] = None
+    ENV_BASE_URL = args.env_url
+    client = _build_client()
+    task_ids = TASK_IDS if args.task == "all" else [args.task]
 
-    result["generated_at"] = started_at
-    _write_report(result, args.output)
+    results: Dict[str, Any] = {
+        "api_base_url": API_BASE_URL,
+        "model_name": args.model,
+        "env_base_url": ENV_BASE_URL,
+        "local_image_name": LOCAL_IMAGE_NAME,
+        "timestamp": time.time(),
+        "results": {},
+    }
 
-    summary = result.get("summary", {})
-    print("BASELINE SUMMARY")
-    print("=" * 60)
-    print(f"Execution mode: {result['execution_mode']}")
-    print(f"Tasks run: {summary.get('tasks_run', 0)}")
-    print(f"Tasks passed: {summary.get('tasks_passed', 0)}")
-    print(f"Mean score: {summary.get('mean_score', 0.0):.4f}")
-    print(f"Saved report to {args.output}")
+    try:
+        _call_env("health")
+    except Exception as exc:
+        _stderr(f"Environment health check failed: {exc}")
+        return 1
 
-    return result
+    for task_id in task_ids:
+        results["results"][task_id] = _run_task(client, task_id, args.model)
+
+    scores = [item["score"] for item in results["results"].values()]
+    results["summary"] = {
+        "tasks_run": len(task_ids),
+        "mean_score": sum(scores) / len(scores) if scores else 0.0,
+    }
+    _write_report(args.output, results)
+    return 0
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        raise
+    raise SystemExit(main())
