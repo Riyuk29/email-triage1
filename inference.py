@@ -21,6 +21,7 @@ these lines strictly:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import re
@@ -34,8 +35,11 @@ from openai import OpenAI
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "meta-llama/Llama-3.1-8B-Instruct")
 HF_TOKEN = os.getenv("HF_TOKEN")
+API_KEY = HF_TOKEN or ""
 ENV_BASE_URL = os.getenv("ENV_BASE_URL", "http://localhost:7860")
 LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME")
+IMAGE_NAME = LOCAL_IMAGE_NAME
+BENCHMARK = "email-triage"
 
 TASK_IDS = ["task_1_easy", "task_2_medium", "task_3_hard"]
 TEMPERATURE = 0.0
@@ -82,16 +86,25 @@ def _stderr(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
 
 
-def _emit_start(task_id: str) -> None:
-    print(f"[START] task={task_id}", flush=True)
+def log_start(task: str, env: str, model: str) -> None:
+    print(f"[START] task={task} env={env} model={model}", flush=True)
 
 
-def _emit_step(step: int, reward: float) -> None:
-    print(f"[STEP] step={step} reward={reward:.4f}", flush=True)
+def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
+    action_str = action.replace("\r", "\\r").replace("\n", "\\n")
+    error_str = (error or "none").replace("\r", "\\r").replace("\n", "\\n")
+    print(
+        f"[STEP] step={step} action={action_str} reward={reward:.4f} done={str(done).lower()} error={error_str}",
+        flush=True,
+    )
 
 
-def _emit_end(task_id: str, score: float, steps: int) -> None:
-    print(f"[END] task={task_id} score={score:.4f} steps={steps}", flush=True)
+def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
+    rewards_json = json.dumps([round(value, 4) for value in rewards], separators=(",", ":"))
+    print(
+        f"[END] success={str(success).lower()} steps={steps} score={score:.4f} rewards={rewards_json}",
+        flush=True,
+    )
 
 
 def _call_env(endpoint: str, method: str = "GET", payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -183,11 +196,8 @@ def _fallback_action(observation: Dict[str, Any]) -> Dict[str, Any]:
     return action
 
 
-def _build_client() -> Optional[OpenAI]:
-    if not HF_TOKEN:
-        _stderr("HF_TOKEN is not set; using deterministic fallback actions.")
-        return None
-    return OpenAI(api_key=HF_TOKEN, base_url=API_BASE_URL)
+def _build_client() -> OpenAI:
+    return OpenAI(api_key=API_KEY, base_url=API_BASE_URL)
 
 
 def _sample_reward(step_result: Dict[str, Any]) -> float:
@@ -225,8 +235,22 @@ def _task_score(task_id: str, action_scores: List[float]) -> float:
         return 0.0
 
 
-def _run_task(client: Optional[OpenAI], task_id: str, model_name: str) -> Dict[str, Any]:
-    reset = _call_env(
+async def _env_call(endpoint: str, method: str = "GET", payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    return await asyncio.to_thread(_call_env, endpoint, method, payload)
+
+
+def _normalize_action_text(action: Dict[str, Any]) -> str:
+    return json.dumps(action, ensure_ascii=True, separators=(",", ":"))
+
+
+def _success_threshold(task_id: str) -> float:
+    from data import TASKS
+
+    return float(TASKS[task_id]["passing_score"])
+
+
+async def _run_task(client: OpenAI, task_id: str, model_name: str) -> Dict[str, Any]:
+    reset = await _env_call(
         "reset",
         "POST",
         {
@@ -238,16 +262,21 @@ def _run_task(client: Optional[OpenAI], task_id: str, model_name: str) -> Dict[s
     done = bool(reset.get("done", observation.get("done", False)))
     total_emails = int(observation.get("total_emails", 0) or 0)
     max_steps = max(total_emails * 4, 1)
-    action_scores: List[float] = []
+    rewards: List[float] = []
+    partial_scores: List[float] = []
+    history: List[str] = []
+    steps_taken = 0
     step = 0
 
-    _emit_start(task_id)
+    log_start(task=task_id, env=BENCHMARK, model=model_name)
 
     while not done and step < max_steps:
-        step += 1
+        step = steps_taken + 1
         action = None
+        action_text = "hello"
+        error: Optional[str] = None
 
-        if client is not None:
+        if HF_TOKEN:
             try:
                 completion = client.chat.completions.create(
                     model=model_name,
@@ -257,35 +286,48 @@ def _run_task(client: Optional[OpenAI], task_id: str, model_name: str) -> Dict[s
                     ],
                     temperature=TEMPERATURE,
                     max_tokens=MAX_TOKENS,
+                    stream=False,
                 )
                 content = completion.choices[0].message.content or ""
                 action = _parse_action(content)
+                if action:
+                    action_text = _normalize_action_text(action)
             except Exception as exc:
+                error = str(exc)
                 _stderr(f"LLM call failed on {task_id} step {step}: {exc}")
 
         if not action:
             action = _fallback_action(observation)
+            action_text = _normalize_action_text(action)
 
-        step_result = _call_env("step", "POST", {"action": action})
+        step_result = await _env_call("step", "POST", {"action": action})
         observation = step_result.get("observation", {})
         done = bool(step_result.get("done", observation.get("done", False)))
         partial_score = observation.get("partial_score", 0.0)
         try:
-            action_scores.append(float(partial_score))
+            partial_scores.append(float(partial_score))
         except (TypeError, ValueError):
-            action_scores.append(0.0)
+            partial_scores.append(0.0)
 
-        _emit_step(step, _sample_reward(step_result))
-        time.sleep(0.05)
+        reward_value = _sample_reward(step_result)
+        rewards.append(reward_value)
+        steps_taken = step
+        log_step(step=step, action=action_text, reward=reward_value, done=done, error=error)
+        history.append(f"Step {step}: {action_text} -> reward {reward_value:+.4f}")
+        await asyncio.sleep(0.05)
 
-    score = _task_score(task_id, action_scores)
-    _emit_end(task_id, score, step)
+    score = _task_score(task_id, partial_scores)
+    success = score >= _success_threshold(task_id)
+    log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
 
     return {
         "task_id": task_id,
         "score": score,
-        "steps": step,
-        "action_scores": action_scores,
+        "steps": steps_taken,
+        "reward_trace": rewards,
+        "history": history,
+        "partial_scores": partial_scores,
+        "success": success,
     }
 
 
@@ -294,7 +336,7 @@ def _write_report(path: str, results: Dict[str, Any]) -> None:
         json.dump(results, handle, indent=2)
 
 
-def main() -> int:
+async def main() -> int:
     global ENV_BASE_URL
 
     parser = argparse.ArgumentParser(description="Run the Email Triage Phase-2 inference baseline")
@@ -318,13 +360,13 @@ def main() -> int:
     }
 
     try:
-        _call_env("health")
+        await _env_call("health")
     except Exception as exc:
         _stderr(f"Environment health check failed: {exc}")
         return 1
 
     for task_id in task_ids:
-        results["results"][task_id] = _run_task(client, task_id, args.model)
+        results["results"][task_id] = await _run_task(client, task_id, args.model)
 
     scores = [item["score"] for item in results["results"].values()]
     results["summary"] = {
@@ -336,4 +378,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(asyncio.run(main()))
